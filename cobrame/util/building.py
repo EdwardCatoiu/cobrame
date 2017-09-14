@@ -1,11 +1,14 @@
-from __future__ import print_function, division, absolute_import
-
-import cobra
-import pandas
 from Bio import SeqIO
+import pandas
 from six import iteritems
 
+from cobrame import util
+from cobrame.util import dogma
 from cobrame import *
+from cobra.core import Reaction
+from ecolime.ecoli_k12 import *
+import cobra
+import itertools
 
 
 def add_transcription_reaction(me_model, TU_name, locus_ids, sequence,
@@ -134,12 +137,6 @@ def add_translation_reaction(me_model, locus_id, dna_sequence=None,
                                        "protein_" + locus_id)
     translation_data.nucleotide_sequence = dna_sequence
 
-    # Add RNA to model if it doesn't exist
-    if "RNA_" + locus_id not in me_model.metabolites:
-        RNA = TranscribedGene('RNA_c')
-        RNA.nucleotide_sequence = dna_sequence
-        me_model.add_metabolites(RNA)
-
     # Create and add TranslationReaction with TranslationData
     translation_reaction = TranslationReaction("translation_" + locus_id)
     me_model.add_reaction(translation_reaction)
@@ -164,12 +161,18 @@ def convert_aa_codes_and_add_charging(me_model, tRNA_aa, tRNA_to_codon,
 
             {locus_id: amino_acid_3_letter_code}
 
+        tRNA_modifications: collections.defaultdict
+            Defaultdict of tRNA locus ID to dictionary of modification ID to
+            number of modifications needed
+
+            {locus_id: {modification_id: value}}
+
         verbose: Boolean
             If True, display metabolites that were not previously added to the
             model and were thus added when creating charging reactions
     """
     # convert amino acid 3 letter codes to metabolites
-    for tRNA, aa in iteritems(tRNA_aa):
+    for tRNA, aa in list(tRNA_aa.items()):
         if aa == "OTHER":
             tRNA_aa.pop(tRNA)
         elif aa == "Sec":
@@ -182,13 +185,13 @@ def convert_aa_codes_and_add_charging(me_model, tRNA_aa, tRNA_to_codon,
                 me_model.metabolites.get_by_id(aa.lower() + "__L_c")
 
     # add in all the tRNA charging reactions
-    for tRNA, aa in iteritems(tRNA_aa):
+    for tRNA, aa in tRNA_aa.items():
         for codon in tRNA_to_codon[tRNA]:
             tRNA_data = tRNAData("tRNA_" + tRNA + "_" + codon, me_model, aa.id,
                                  "RNA_" + tRNA, codon)
             charging_reaction = tRNAChargingReaction("charging_tRNA_" + tRNA +
                                                      "_" + codon)
-            charging_reaction.tRNA_data = tRNA_data
+            charging_reaction.tRNAData = tRNA_data
 
             me_model.add_reaction(charging_reaction)
             charging_reaction.update(verbose=verbose)
@@ -200,6 +203,7 @@ def build_reactions_from_genbank(me_model, gb_filename, TU_frame=None,
                                  tRNA_to_codon={}, update=True):
 
     # TODO handle special RNAse without type ('b3123')
+    # TODO: move tRNA mods and folding its own function
     """Creates and adds transcription and translation reactions using genomic
      information from the organism's genbank file. Adds in the basic
      requirements for these reactions. Organism specific components are added
@@ -228,6 +232,12 @@ def build_reactions_from_genbank(me_model, gb_filename, TU_frame=None,
             feature.types in this set. This uses the nomenclature of the
             genbank file (gb_filename)
 
+        tRNA_modifications: collections.defaultdict
+            Defaultdict of tRNA locus ID to dictionary of modification ID to
+            number of modifications needed. If None then no modifications will
+            be added to the tRNA
+
+            {locus_id: {modification_id: value}}
 
         verbose: Boolean
             If True, display metabolites that were not previously added to the
@@ -298,7 +308,7 @@ def build_reactions_from_genbank(me_model, gb_filename, TU_frame=None,
         # ---- Add gene metabolites and apply frameshift mutations----
         frameshift_string = frameshift_dict.get(bnum)
         if len(seq) % 3 != 0 and frameshift_string:
-            print('Applying frameshift on %s' % bnum)
+            print 'Applying frameshift on %s' % bnum
             seq = dogma.return_frameshift_sequence(full_seq, frameshift_string)
             if strand == '-':
                 seq = dogma.reverse_transcribe(seq)
@@ -416,11 +426,49 @@ def add_m_model_content(me_model, m_model, complex_metabolite_ids=[]):
                                             in iteritems(reaction.metabolites)}
 
 
+def add_generic_RNase(me_model):
+
+    generic_RNase_list = eval('generic_RNase_list')
+
+    for cplx in generic_RNase_list:
+        new_rxn = MEReaction('complex_' + cplx + '_to_generic')
+        me_model.add_reaction(new_rxn)
+        new_rxn.reaction = cplx + ' --> generic_RNase'
+
+
+def add_modification_data(me_model, mod_id, mod_stoich, mod_enzyme=None):
+    mod = ModificationData(mod_id, me_model)
+    mod.stoichiometry = mod_stoich
+    mod.enzyme = mod_enzyme
+    return mod
+
+
+def add_excision_machinery(me_model):
+
+    excision_types = ['rRNA_containing', 'monocistronic',
+                      'polycistronic_wout_rRNA']
+    for excision in excision_types:
+        excision_dict = {}
+        r = cobra.Reaction('combine_' + excision + '_excision_machinery')
+        for machine in eval(excision):
+            for ion in eval('divalent_list'):
+                machine = machine.replace(ion, 'generic_divalent')
+            excision_dict[Metabolite(machine)] = -1
+        excision_dict[Metabolite(excision + '_excision_set')] = 1
+        r.add_metabolites(excision_dict)
+        me_model.add_reaction(r)
+
+        # Add modification data objects for TU excision reactions
+        rRNA_mod = ModificationData(excision + '_excision', me_model)
+        rRNA_mod.stoichiometry = {'h2o_c': -1, 'h_c': 1}
+        rRNA_mod.enzyme = excision + '_excision_set'
+
+
 def add_dummy_reactions(me_model, dna_seq, update=True):
     dummy = StoichiometricData("dummy_reaction", me_model)
     dummy.lower_bound = 0
     dummy.upper_bound = 1000
-    dummy._stoichiometry = {'CPLX_dummy': -1}
+    dummy._stoichiometry = {}
 
     create_transcribed_gene(me_model, 'dummy', 0, len(dna_seq), dna_seq, '+',
                             'mRNA')
@@ -431,7 +479,7 @@ def add_dummy_reactions(me_model, dna_seq, update=True):
     try:
         complex_data = ComplexData("CPLX_dummy", me_model)
     except ValueError:
-        warn('CPLX_dummy already in model')
+        print 'CPLX_dummy already in model'
         complex_data = me_model.complex_data.get_by_id('CPLX_dummy')
     complex_data.stoichiometry = {"protein_dummy": 1}
     if update:
@@ -440,12 +488,43 @@ def add_dummy_reactions(me_model, dna_seq, update=True):
 
 def add_complex_stoichiometry_data(me_model, ME_complex_dict):
     warn('deprecated')
-    for cplx, stoichiometry in iteritems(ME_complex_dict):
+    for cplx, stoichiometry in ME_complex_dict.iteritems():
         complex_data = ComplexData(cplx, me_model)
 
         # stoichiometry is a defaultdict so much build as follows
-        for complex, value in iteritems(stoichiometry):
+        for complex, value in stoichiometry.items():
             complex_data.stoichiometry[complex] = value
+
+
+def add_modication_data(me_model, mod_id, mod_dict, enzyme=None, keff=65):
+    warn('deprecated')
+    try:
+        mod = me_model.modification_data.get_by_id(mod_id)
+    except:
+        mod = ModificationData(mod_id, me_model)
+        mod.stoichiometry = mod_dict
+
+    if not enzyme:
+        mod.enzyme = enzyme
+        mod.keff = keff
+
+
+def add_complex_modification_data(me_model, modification_dict):
+    warn('deprecated')
+    for mod_complex_id, mod_complex_info in iteritems(modification_dict):
+
+        unmod_complex_id, mods = mod_complex_info
+        unmod_complex = me_model.complex_data.get_by_id(unmod_complex_id)
+
+        cplx = ComplexData(mod_complex_id, me_model)
+        cplx.stoichiometry = unmod_complex.stoichiometry
+        cplx.translocation = unmod_complex.translocation
+        cplx.chaperones = unmod_complex.chaperones
+
+        for mod_comp, mod_count in iteritems(mods):
+            mod_id = "mod_" + mod_comp
+            cplx.modifications[mod_id] = -mod_count
+            add_modication_data(me_model, mod_id, {mod_comp: -1})
 
 
 def add_complex_to_model(me_model, complex_id, complex_stoichiometry,
@@ -469,51 +548,19 @@ def add_complex_to_model(me_model, complex_id, complex_stoichiometry,
 
     complex_data = ComplexData(complex_id, me_model)
     # must add update stoichiometry one by one since it is a defaultdict
-    for metabolite, value in iteritems(complex_stoichiometry):
+    for metabolite, value in complex_stoichiometry.items():
         complex_data.stoichiometry[metabolite] += value
-    for modification, value in iteritems(complex_modifications):
+    for modification, value in complex_modifications.items():
         complex_data.modifications[modification] = value
 
 
-def add_modification_data(me_model, modification_id,
-                          modification_stoichiometry,
-                          modification_enzyme=None, verbose=True):
-    """
-    Creates a ModificationData object for each modification defined by the
-    function inputs.
-
-    It's assumed every complex modification occurs spontaneously, unless
-
-    If a modification uses an enzyme this can be updated after the
-    ModificationData object is already created
-
-
-    Args:
-        me_model: class:cobrame.MEModel
-        metabolite: str
-            ID of the metabolite that the enzyme complex is being modified by
-
-    """
-
-    if modification_id in me_model.modification_data:
-        if verbose:
-            warn('Modification (%s) already in model' % modification_id)
-        else:
-            pass
-    else:
-        modification_data = ModificationData(modification_id, me_model)
-        modification_data.stoichiometry = modification_stoichiometry
-        modification_data.enzyme = modification_enzyme
-
-
 def add_model_complexes(me_model, complex_stoichiometry_dict,
-                        complex_modification_dict, verbose=True):
+                        complex_modification_dict):
     """
     Construct ComplexData for complexes into MEModel from its subunit
-    stoichiometry, and a dictionary of its modification metabolites.
-
-    It is assumed that each modification adds one equivalent of the
-    modification metabolite. Multiple
+    stoichiometry, and a dictionary of its modification metabolites. If a
+    the given modification_data for a metabolite is not in the model,
+    it will be added automatically.
 
 
     Intended to be used as a function for large-scale complex addition.
@@ -532,21 +579,22 @@ def add_model_complexes(me_model, complex_stoichiometry_dict,
                                                   stoichiometry}}}
 
     """
-    for complex_id, stoichiometry in iteritems(complex_stoichiometry_dict):
+    for complex_id, stoichiometry in complex_stoichiometry_dict.items():
         add_complex_to_model(me_model, complex_id, stoichiometry, {})
 
-    for modified_complex_id, info in iteritems(complex_modification_dict):
+    for modified_complex_id, info in complex_modification_dict.items():
         modification_dict = {}
-        for metabolite, number in iteritems(info['modifications']):
+        for metabolite, number in info['modifications'].items():
             modification_id = 'mod_' + metabolite
-            add_modification_data(me_model, modification_id, {metabolite: -1},
-                                  verbose=verbose)
-            # stoichiometry of modification determined in
-            # modification_data.stoichiometry
-            modification_dict[modification_id] = abs(number)
+            if modification_id not in me_model.modification_data:
+                mod = ModificationData(modification_id, me_model)
+                # Assumed every complex modification occurs spontaneously
+                # and adds one equivalent of the modification metabolite
+                # TODO Add modifications separately before adding complexes
+                mod.stoichiometry = {metabolite: -1.}
+            modification_dict[modification_id] = -number
 
-        core_enzyme = \
-            complex_modification_dict[modified_complex_id]['core_enzyme']
+        core_enzyme = complex_modification_dict[modified_complex_id]['core_enzyme']
         stoichiometry = complex_stoichiometry_dict[core_enzyme]
 
         add_complex_to_model(me_model, modified_complex_id, stoichiometry,
@@ -584,11 +632,10 @@ def add_metabolic_reaction_to_model(me_model, stoichiometric_data_id,
     """
     # Get stoichiometric data for reaction being added
     try:
-        stoichiometric_data = \
-            me_model.stoichiometric_data.get_by_id(stoichiometric_data_id)
+        stoichiometric_data = me_model.stoichiometric_data.get_by_id(stoichiometric_data_id)
     except KeyError:
         raise Exception("Stoichiometric data for %s has not been added to"
-                        " model" % stoichiometric_data_id)
+                        "model" % stoichiometric_data_id)
 
     # Get complex data and id based on arguments passed into function
     if type(complex_id) == str:
@@ -646,7 +693,7 @@ def add_reactions_from_stoichiometric_data(me_model, rxn_to_cplx_dict,
             {StoichiometricData.id: catalytic_enzyme_id}
 
 
-        rxn_info_frame: :class:`pandas.Dataframe
+        rxn_info_frame: pandas.Dataframe
             Contains the ids, names and reversibility for each reaction in the
             metabolic reaction matrix as well as whether the reaction is
             spontaneous
@@ -673,7 +720,10 @@ def add_reactions_from_stoichiometric_data(me_model, rxn_to_cplx_dict,
         try:
             complexes_list = rxn_to_cplx_dict[reaction_data.id]
         except KeyError:
-            complexes_list = [None]
+            if reaction_data.id == "dummy_reaction":
+                complexes_list = ["CPLX_dummy"]
+            else:
+                complexes_list = [None]
 
         # Add metabolic reactions for each isozyme
         for complex_id in complexes_list:
@@ -682,10 +732,6 @@ def add_reactions_from_stoichiometric_data(me_model, rxn_to_cplx_dict,
                 directionality_list.append('reverse')
             if reaction_data.upper_bound > 0:
                 directionality_list.append('forward')
-            elif reaction_data.upper_bound == 0 and \
-                            reaction_data.lower_bound == 0:
-                directionality_list.append('forward')
-                warn('Reaction (%s) cannot carry flux' % reaction_data.id)
             for directionality in directionality_list:
                 add_metabolic_reaction_to_model(me_model, reaction_data.id,
                                                 directionality,
